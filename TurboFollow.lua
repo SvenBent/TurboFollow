@@ -1,6 +1,6 @@
 _addon.name = 'TurboFollow'
 _addon.author = 'Daneblood'
-_addon.version = '26.05.18z4'
+_addon.version = '26.05.21j'
 _addon.commands = {'turbofollow', 'tfo', 'ffo'}
 
 require('coroutine')
@@ -102,10 +102,15 @@ load_settings()
 -- Follow state.
 local broadcasting = false
 local following = false
+local follower_count = 0
+
+-- Forward declaration used by become_leader() before the function body.
+local send_position_if_needed
 
 local target_x = nil
 local target_y = nil
 local target_zone = nil
+local leader_current_zone = nil
 
 local min_dist_sq = settings.min * settings.min
 local max_dist_sq = 50 * 50
@@ -145,6 +150,7 @@ local function clear_target()
     target_x = nil
     target_y = nil
     target_zone = nil
+    leader_current_zone = nil
 end
 
 local function stop_running()
@@ -154,11 +160,22 @@ local function stop_running()
     end
 end
 
+local self_name_cache = nil
+
 local function get_self_name()
+    if self_name_cache then
+        return self_name_cache
+    end
+
     local self = windower.ffxi.get_player()
         or windower.ffxi.get_mob_by_target('me')
 
-    return self and self.name and self.name:lower() or nil
+    self_name_cache = self and self.name and self.name:lower() or nil
+    return self_name_cache
+end
+
+local function clear_self_name_cache()
+    self_name_cache = nil
 end
 
 local function send_stopfollowing()
@@ -227,11 +244,19 @@ local function become_leader()
     -- New followme leader overrides previous group leader.
     broadcasting = false
     following = false
+    follower_count = 0
 
     clear_target()
     stop_running()
 
     windower.send_ipc_message('follow ' .. self.name:lower())
+
+    -- Force an immediate coordinate update so followers can start moving
+    -- even if the leader is standing still when //tfo me is used.
+    last_sent_x = nil
+    last_sent_y = nil
+    last_sent_zone = nil
+    send_position_if_needed()
 end
 
 local function move_to_target()
@@ -247,11 +272,21 @@ local function move_to_target()
         return
     end
 
+    -- Never run toward a saved target from a different follower zone.
+    -- The saved target should be the last valid coordinate from this zone.
+    if target_zone ~= info.zone then
+        stop_running()
+        return
+    end
+
     local dx = target_x - self.x
     local dy = target_y - self.y
     local dist_sq = dx * dx + dy * dy
 
-    if target_zone == info.zone and dist_sq > min_dist_sq and dist_sq < max_dist_sq then
+    local leader_in_same_zone = leader_current_zone == nil or leader_current_zone == info.zone
+    local ignore_min_distance = not leader_in_same_zone
+
+    if dist_sq < max_dist_sq and (ignore_min_distance or dist_sq > min_dist_sq) then
         local len = math.sqrt(dist_sq)
 
         if len < 1 then
@@ -265,31 +300,16 @@ local function move_to_target()
     end
 end
 
--- Between IPC updates, only enforce stop/safety checks.
+-- Between IPC updates, re-apply the same movement rules.
 local function check_stop_only()
-    if not running or target_x == nil or target_y == nil or target_zone == nil then
+    if not running then
         return
     end
 
-    local self = windower.ffxi.get_mob_by_target('me')
-    local info = windower.ffxi.get_info()
-
-    if not self or not info then
-        return
-    end
-
-    local dx = target_x - self.x
-    local dy = target_y - self.y
-    local dist_sq = dx * dx + dy * dy
-
-    if target_zone ~= info.zone
-    or dist_sq <= min_dist_sq
-    or dist_sq >= max_dist_sq then
-        stop_running()
-    end
+    move_to_target()
 end
 
-local function send_position_if_needed()
+send_position_if_needed = function()
     local self = windower.ffxi.get_mob_by_target('me')
     local info = windower.ffxi.get_info()
 
@@ -311,14 +331,12 @@ local function send_position_if_needed()
     last_sent_zone = info.zone
 
     windower.send_ipc_message(
-        'update '
-        .. self.name:lower()
-        .. ' '
-        .. info.zone
-        .. ' '
-        .. self.x
-        .. ' '
-        .. self.y
+        ('update %s %d %.2f %.2f'):format(
+            self.name:lower(),
+            info.zone,
+            self.x,
+            self.y
+        )
     )
 end
 
@@ -417,6 +435,7 @@ local function update_speed_display()
 end
 
 windower.register_event('unload', function()
+    clear_self_name_cache()
     hide_speed_box()
 
     windower.send_command('TurboFollow stop')
@@ -424,6 +443,7 @@ windower.register_event('unload', function()
 end)
 
 windower.register_event('login', function()
+    clear_self_name_cache()
     load_settings()
     min_dist_sq = settings.min * settings.min
 end)
@@ -460,6 +480,7 @@ windower.register_event('addon command', function(command, ...)
     elseif command == 'stopall' then
         broadcasting = false
         following = false
+        follower_count = 0
 
         clear_target()
         stop_running()
@@ -521,6 +542,32 @@ windower.register_event('addon command', function(command, ...)
 
         windower.add_to_chat(207, 'TurboFollow: ShowSpeed is ' .. (settings.show_speed and 'ON' or 'OFF'))
 
+    elseif command == 'info' then
+        local following_text
+
+        if following then
+            following_text = 'Yes: ' .. following
+        else
+            following_text = 'No'
+        end
+
+        windower.add_to_chat(207, 'TurboFollow Info:')
+        windower.add_to_chat(207, 'Following someone: ' .. following_text)
+        windower.add_to_chat(207, 'Followers following me: ' .. tostring(follower_count or 0))
+
+        if target_x and target_y then
+            windower.add_to_chat(
+                207,
+                ('Target Coordinate: [Zone %d] %.2f %.2f'):format(
+                    target_zone or 0,
+                    target_x,
+                    target_y
+                )
+            )
+        else
+            windower.add_to_chat(207, 'Target Coordinate: None')
+        end
+
     elseif command == 'help' then
         windower.add_to_chat(207, 'TurboFollow Commands:')
         windower.add_to_chat(207, '//tfo me or //ffo me - Make others follow this character')
@@ -530,6 +577,7 @@ windower.register_event('addon command', function(command, ...)
         windower.add_to_chat(207, '//tfo min <distance> - Set minimum follow distance')
         windower.add_to_chat(207, '//tfo showspeed on|off - Show current movement speed')
         windower.add_to_chat(207, '//tfo alpha <0-255> - Set ShowSpeed background alpha')
+        windower.add_to_chat(207, '//tfo info - Show follow status and current target coordinate')
         windower.add_to_chat(207, '//tfo help - Show this help')
         windower.add_to_chat(207, 'Settings save to data/<character>.xml.')
 
@@ -552,6 +600,7 @@ windower.register_event('ipc message', function(msg)
     if command == 'stop' then
         broadcasting = false
         following = false
+        follower_count = 0
 
         clear_target()
         stop_running()
@@ -569,6 +618,7 @@ windower.register_event('ipc message', function(msg)
         if self_name == new_leader then
             broadcasting = false
             following = false
+            follower_count = 0
 
             clear_target()
             stop_running()
@@ -585,8 +635,16 @@ windower.register_event('ipc message', function(msg)
             return
         end
 
-        -- One or more followers exist, so this character should broadcast position.
-        broadcasting = true
+        -- Count active followers. Broadcasting stays on until the count reaches zero.
+        follower_count = follower_count + 1
+        broadcasting = follower_count > 0
+
+        -- Force a fresh update for this follower in case the leader has not moved
+        -- enough to pass the normal jitter threshold yet.
+        last_sent_x = nil
+        last_sent_y = nil
+        last_sent_zone = nil
+        send_position_if_needed()
 
     elseif command == 'stopfollowing' then
         local self_name = get_self_name()
@@ -595,16 +653,37 @@ windower.register_event('ipc message', function(msg)
             return
         end
 
-        broadcasting = false
+        follower_count = math.max(0, follower_count - 1)
+        broadcasting = follower_count > 0
 
     elseif command == 'update' then
         if not following or a ~= following then
             return
         end
 
-        target_zone = tonumber(b)
-        target_x = tonumber(c)
-        target_y = tonumber(d)
+        local leader_zone = tonumber(b)
+        local leader_x = tonumber(c)
+        local leader_y = tonumber(d)
+
+        if not leader_zone or not leader_x or not leader_y then
+            return
+        end
+
+        -- Track the leader's latest zone even when we reject the new coordinates.
+        -- This lets us use dedicated zoning movement while the leader is zoning away.
+        leader_current_zone = leader_zone
+
+        local info = windower.ffxi.get_info()
+        if not info or leader_zone ~= info.zone then
+            -- Leader is in another zone. Ignore the new-zone coordinate,
+            -- but keep running toward the last valid same-zone coordinate.
+            move_to_target()
+            return
+        end
+
+        target_zone = leader_zone
+        target_x = leader_x
+        target_y = leader_y
 
         -- Immediate reaction on fresh IPC update.
         move_to_target()
