@@ -1,6 +1,6 @@
 _addon.name = 'TurboFollow'
 _addon.author = 'Daneblood'
-_addon.version = '26.05.22d'
+_addon.version = '26.05.22g'
 _addon.commands = {'turbofollow', 'tfo'}
 
 require('coroutine')
@@ -29,12 +29,14 @@ local function get_character_settings_file()
     return ('data/%s.xml'):format(player.name:lower())
 end
 
-local function get_default_settings()
-    return {
-        min = defaults.min,
-        show_speed = defaults.show_speed,
-        strict_mode = defaults.strict_mode,
-    }
+local function copy_defaults()
+    local copied = {}
+
+    for key, value in pairs(defaults) do
+        copied[key] = value
+    end
+
+    return copied
 end
 
 local function load_settings()
@@ -43,7 +45,7 @@ local function load_settings()
     -- No character name yet: use in-code defaults only.
     if not file then
         if not settings then
-            settings = get_default_settings()
+            settings = copy_defaults()
         end
 
         return
@@ -54,14 +56,9 @@ local function load_settings()
     end
 
     settings_file = file
+    settings = config.load(settings_file, defaults) or copy_defaults()
 
-    if windower.dir_exists(windower.addon_path .. 'data') then
-        settings = config.load(settings_file, defaults) or get_default_settings()
-    else
-        settings = get_default_settings()
-    end
-
-    settings.min = settings.min or defaults.min
+    settings.min = tonumber(settings.min) or defaults.min
 
     if settings.show_speed == nil then
         settings.show_speed = defaults.show_speed
@@ -77,7 +74,7 @@ end
 
 local function save_settings()
     if not settings then
-        load_settings()
+        return
     end
 
     settings_file = get_character_settings_file()
@@ -94,12 +91,7 @@ local function save_settings()
     end
 
     -- Persist character settings. Do not save speed box UI settings.
-    settings.speed_display = nil
-    settings.min = settings.min or defaults.min
-    settings.show_speed = settings.show_speed and true or false
-    settings.strict_mode = settings.strict_mode and true or false
-    settings.alpha = tonumber(settings.alpha) or defaults.alpha
-    settings.alpha = math.min(math.max(0, settings.alpha), 255)
+--    settings.speed_display = nil
 
     config.save(settings)
 end
@@ -134,6 +126,7 @@ local speed_box = nil
 local speed_box_visible = false
 local last_speed_text = nil
 local speed_x = nil
+local last_party_count = nil
 
 local speed_display = {
     bg = {
@@ -163,8 +156,6 @@ end
 
 local function get_self_name()
     local self = windower.ffxi.get_player()
-        or windower.ffxi.get_mob_by_target('me')
-
     return self and self.name and self.name:lower() or nil
 end
 
@@ -217,7 +208,7 @@ local function start_following(name)
 end
 
 local function become_leader()
-    local self = windower.ffxi.get_mob_by_target('me')
+    local self = windower.ffxi.get_player()
 
     if not self and not repeated then
         repeated = true
@@ -318,16 +309,7 @@ local function send_position_if_needed()
     last_sent_y = self.y
     last_sent_zone = info.zone
 
-    windower.send_ipc_message(
-        'update '
-        .. self.name:lower()
-        .. ' '
-        .. info.zone
-        .. ' '
-        .. self.x
-        .. ' '
-        .. self.y
-    )
+    windower.send_ipc_message(('update %s %s %s %s'):format(self.name:lower(), info.zone, self.x, self.y))
 end
 
 local function hide_speed_box()
@@ -344,10 +326,6 @@ local function show_speed_box()
     end
 end
 
-local function apply_speed_display_settings()
-    speed_display.bg.alpha = tonumber(settings.alpha) or defaults.alpha
-end
-
 local function ensure_speed_box()
     if speed_box then
         return
@@ -357,7 +335,7 @@ local function ensure_speed_box()
         texts = require('texts')
     end
 
-    apply_speed_display_settings()
+    speed_display.bg.alpha = settings.alpha
 
     -- Use the same texts.new(text, settings) pattern as DParty.
     speed_box = texts.new('  +0', speed_display)
@@ -372,20 +350,17 @@ local function update_speed_box_position()
     end
 
     local party = windower.ffxi.get_party()
-    local party_count = party and tonumber(party.party1_count) or 1
-
-    if party_count < 1 then
-        party_count = 1
-    elseif party_count > 6 then
-        party_count = 6
-    end
+	local party_count = party and party.party1_count or 1
 
     if not speed_x then
         speed_x = windower.get_windower_settings().ui_x_res - 166
+        speed_box:pos_x(speed_x)
     end
 
-    speed_box:pos_x(speed_x)
-    speed_box:pos_y(-20 * party_count - 24)
+    if party_count ~= last_party_count then
+        last_party_count = party_count
+        speed_box:pos_y(-20 * party_count - 24)
+    end
 end
 
 local function get_speed_text(mob)
@@ -538,19 +513,13 @@ windower.register_event('addon command', function(command, ...)
             settings.strict_mode = true
         elseif value == 'soft' then
             settings.strict_mode = false
-        elseif not value or value == '' then
-            settings.strict_mode = not settings.strict_mode
         else
-            windower.add_to_chat(207, 'TurboFollow: Use //tfo mode [strict|soft]')
-            return
+            settings.strict_mode = not settings.strict_mode
         end
 
         pcall(save_settings)
 
-        windower.add_to_chat(
-            207,
-            'TurboFollow: Follow mode set to '
-            .. (settings.strict_mode and 'strict' or 'soft')
+        windower.add_to_chat(207,'TurboFollow: Follow mode set to '..(settings.strict_mode and 'strict' or 'soft')
         )
 
     elseif command == 'help' then
